@@ -63,16 +63,16 @@ const movieSchema: Schema = {
 const getStyleInstructions = (style: VisualStyle): string => {
   switch (style) {
     case 'cartoon-3d':
-      return "Стиль: 3D мультфильм, объемный, яркий.";
+      return "Стиль: 3D мультфильм, объемный, используй градиенты (defs/radialGradient) если SVG.";
     case 'cinematic':
-      return "Стиль: Кинематографичный, реалистичное освещение, детализация.";
+      return "Стиль: Кинематографичный, сложная композиция.";
     case 'hand-drawn':
-      return "Стиль: Рисованный от руки, скетч.";
+      return "Стиль: Рисованный от руки, неровные линии, stroke-width: 2.";
     case 'pixel-art':
-      return "Стиль: Пиксель арт.";
+      return "Стиль: Пиксель арт, используй множество маленьких <rect>.";
     case 'flat':
     default:
-      return "Стиль: Векторная графика, плоский дизайн.";
+      return "Стиль: Векторная графика, плоский дизайн, минимализм.";
   }
 };
 
@@ -142,6 +142,16 @@ export const generateMovie = async (prompt: string, style: VisualStyle, mode: Ge
     `;
   }
 
+  // Optimized System Prompt with SVG best practices
+  const svgInstruction = mode === 'svg' ? `
+    ВАЖНО ДЛЯ SVG (Strict Mode):
+    1. Для рисования персонажей и фона используй ПРОСТЫЕ примитивы: <rect>, <circle>, <ellipse>, <line>, <polyline>, <polygon>.
+    2. Избегай сложных <path> с огромным количеством точек, так как это часто приводит к ошибкам рендеринга.
+    3. Если нужен сложный объект, собери его из нескольких простых геометрических фигур (группируй через <g>).
+    4. Убедись, что все теги закрыты. Не используй внешние ссылки (<image>).
+    5. Используй яркие и контрастные цвета (fill), чтобы персонажи выделялись.
+  ` : '';
+
   // 1. Generate Script and Structure
   const response = await genAI.models.generateContent({
     model: "gemini-3-flash-preview",
@@ -149,6 +159,7 @@ export const generateMovie = async (prompt: string, style: VisualStyle, mode: Ge
     
     Режим генерации: ${mode === 'image' ? 'Используем генерацию картинок (Nano Banana).' : 'Используем SVG.'}
     ${styleInstruction}
+    ${svgInstruction}
     ${characterContext}
 
     Требования:
@@ -156,13 +167,13 @@ export const generateMovie = async (prompt: string, style: VisualStyle, mode: Ge
     2. Поле 'description' должно содержать ПОЛНОЕ описание кадра, включая персонажей, их позы и эмоции, так как спрайты накладываться не будут (для режима image).
     3. Персонажи:
        - Если режим 'image': поле 'svgBody' оставь пустым. Персонажи будут нарисованы прямо в фоне.
-       - Если режим 'svg': заполни 'svgBody'.
+       - Если режим 'svg': заполни 'svgBody', следуя правилам SVG (Strict Mode).
     4. Язык JSON: Русский.
     `,
     config: {
       responseMimeType: "application/json",
       responseSchema: movieSchema,
-      systemInstruction: "Ты режиссер анимации."
+      systemInstruction: "Ты опытный режиссер анимации и технический художник SVG."
     }
   });
 
@@ -177,7 +188,7 @@ export const generateMovie = async (prompt: string, style: VisualStyle, mode: Ge
   if (mode === 'image') {
       for (const scene of movieData.scenes) {
           // Generate full scene with characters
-          const scenePrompt = `${styleInstruction} Full scene illustration. ${scene.description}. High quality, detailed.`;
+          const scenePrompt = `${styleInstruction} Full scene illustration. ${scene.description}. High quality, detailed, visual storytelling.`;
           const bgImage = await generateImage(scenePrompt);
           if (bgImage) scene.backgroundImageUrl = bgImage;
           
@@ -191,9 +202,13 @@ export const generateMovie = async (prompt: string, style: VisualStyle, mode: Ge
 
 export const generateSceneFromPrompt = async (prompt: string, currentMovie: Movie): Promise<Scene> => {
     const sceneSchema: Schema = movieSchema.properties!.scenes!.items as Schema;
+    
+    // Add SVG hints for scene generation too
+    const svgHint = currentMovie.mode === 'svg' ? "Используй простые примитивы SVG (rect, circle) для надежности." : "";
+
     const sceneResponse = await genAI.models.generateContent({
         model: "gemini-3-flash-preview",
-        contents: `Сгенерируй ОДНУ новую сцену. Контекст: ${currentMovie.title}. Стиль: ${currentMovie.style}. Запрос: "${prompt}".`,
+        contents: `Сгенерируй ОДНУ новую сцену. Контекст: ${currentMovie.title}. Стиль: ${currentMovie.style}. Запрос: "${prompt}". ${svgHint}`,
         config: { responseMimeType: "application/json", responseSchema: sceneSchema }
     });
 
