@@ -1,0 +1,8 @@
+{
+  "name": "AI SVG Cinema",
+  "description": "Generate mini animated SVG movies with dialogue from a simple text prompt using Gemini AI.",
+  "requestFramePermissions": [
+    "display-capture",
+    "microphone"
+  ]
+}
