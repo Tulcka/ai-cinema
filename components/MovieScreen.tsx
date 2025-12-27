@@ -41,7 +41,6 @@ async function decodeAudioData(
 
 export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinish }) => {
   const [sceneIndex, setSceneIndex] = useState(0);
-  // scriptIndex: -2 = Pre-loading, -1 = Narrator, 0+ = Dialogue
   const [scriptIndex, setScriptIndex] = useState(-2); 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentLine, setCurrentLine] = useState<DialogueLine | null>(null);
@@ -55,24 +54,61 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
   
   const scene = movie.scenes[sceneIndex];
 
+  // --- BROWSER TTS HELPER ---
+  const speakBrowser = (text: string, onEnd: () => void) => {
+    if (!window.speechSynthesis) {
+        onEnd();
+        return;
+    }
+    
+    // Cancel previous
+    window.speechSynthesis.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.lang = 'ru-RU'; // Default to Russian
+    utterance.rate = 1.0;
+
+    // Try to vary pitch based on character if possible, but basic browser TTS is limited
+    // We can try to pick a voice, but it's flaky across browsers.
+    // For now, standard voice.
+    
+    utterance.onend = () => {
+        onEnd();
+    };
+    utterance.onerror = () => {
+        onEnd();
+    };
+
+    window.speechSynthesis.speak(utterance);
+  };
+
   useEffect(() => {
-    const Ctx = window.AudioContext || (window as any).webkitAudioContext;
-    audioCtxRef.current = new Ctx({ sampleRate: 24000 });
+    if (movie.audioMode === 'gemini') {
+        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+        audioCtxRef.current = new Ctx({ sampleRate: 24000 });
+    }
     return () => {
       activeSourceRef.current?.stop();
       audioCtxRef.current?.close();
+      window.speechSynthesis.cancel();
     };
-  }, []);
+  }, [movie.audioMode]);
 
   const getAudioKey = (sIdx: number, lIdx: number) => {
-      if (lIdx === -1) return `${movie.scenes[sIdx].id}-narrator`; // Narrator key
+      if (lIdx === -1) return `${movie.scenes[sIdx].id}-narrator`; 
       return `${movie.scenes[sIdx].id}-line-${lIdx}`;
   };
 
-  // Sequential loading to avoid 429 errors
+  // Pre-fetch Audio (Only for Gemini Mode)
   const prepareSceneAudio = async (idx: number) => {
     const s = movie.scenes[idx];
     if (!s) return;
+
+    if (movie.audioMode === 'browser') {
+        // No pre-loading needed for browser TTS
+        setIsPreparingAudio(false);
+        return;
+    }
 
     if (audioCtxRef.current?.state === 'suspended') {
         await audioCtxRef.current.resume();
@@ -80,27 +116,25 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
 
     setIsPreparingAudio(true);
 
-    // 1. Generate Narrator Audio
+    // 1. Narrator
     const narrKey = getAudioKey(idx, -1);
     if (!audioCache.current.has(narrKey) && s.description) {
-        // Generate narrator audio
         const narrAudio = await generateSpeech(s.description, voices.get('narrator') || 'Fenrir');
         if (narrAudio && audioCtxRef.current) {
              const buffer = await decodeAudioData(decode(narrAudio), audioCtxRef.current, 24000, 1);
              audioCache.current.set(narrKey, buffer);
         }
-        // Small delay between calls
         await new Promise(r => setTimeout(r, 500)); 
     }
 
-    // 2. Generate Script Audio (Sequentially)
+    // 2. Script
     for (let lIdx = 0; lIdx < s.script.length; lIdx++) {
       const line = s.script[lIdx];
       const key = getAudioKey(idx, lIdx);
       if (audioCache.current.has(key)) continue;
 
       let voice = voices.get(line.characterId);
-      if (!voice) voice = 'Puck'; // Fallback
+      if (!voice) voice = 'Puck'; 
 
       const audioBase64 = await generateSpeech(line.text, voice);
       if (audioBase64 && audioCtxRef.current) {
@@ -111,7 +145,6 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
             console.error("Audio decoding failed", err);
         }
       }
-      // Delay to respect rate limits
       await new Promise(r => setTimeout(r, 800)); 
     }
 
@@ -122,7 +155,7 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
   useEffect(() => {
     prepareSceneAudio(0).then(() => {
         setIsPlaying(true);
-        setScriptIndex(-1); // Start with Narrator
+        setScriptIndex(-1);
     });
   }, []);
 
@@ -149,49 +182,54 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
         activeSourceRef.current = source;
     };
 
+    const handlePlaybackStep = (text: string, audioKey: string, nextStep: () => void) => {
+        if (!audioEnabled) {
+             const duration = Math.max(2000, text.length * 60);
+             const timer = setTimeout(nextStep, duration);
+             return () => clearTimeout(timer);
+        }
+
+        if (movie.audioMode === 'browser') {
+            speakBrowser(text, () => {
+                setTimeout(nextStep, 500);
+            });
+        } else {
+            // Gemini Audio
+            const buffer = audioCache.current.get(audioKey);
+            if (buffer) {
+                playAudioBuffer(buffer, () => {
+                    setTimeout(nextStep, 500);
+                });
+            } else {
+                // Fallback if audio gen failed
+                const duration = Math.max(2000, text.length * 60);
+                setTimeout(nextStep, duration);
+            }
+        }
+    };
+
     // A. Narrator Phase
     if (scriptIndex === -1) {
         setCurrentLine(null);
         setIsNarrating(true);
-        
         const narrKey = getAudioKey(sceneIndex, -1);
-        const buffer = audioCache.current.get(narrKey);
-
-        if (audioEnabled && buffer) {
-            playAudioBuffer(buffer, () => {
-                setTimeout(() => {
-                    setIsNarrating(false);
-                    setScriptIndex(0); // Move to dialogue
-                }, 500);
-            });
-        } else {
-            // Text fallback for narrator
-            const duration = Math.max(2000, (currentScene.description?.length || 0) * 60);
-            const timer = setTimeout(() => {
-                setIsNarrating(false);
-                setScriptIndex(0);
-            }, duration);
-            return () => clearTimeout(timer);
-        }
+        const text = currentScene.description || "";
+        
+        handlePlaybackStep(text, narrKey, () => {
+            setIsNarrating(false);
+            setScriptIndex(0);
+        });
     } 
     // B. Dialogue Phase
     else if (scriptIndex >= 0 && scriptIndex < currentScene.script.length) {
         const line = currentScene.script[scriptIndex];
         setCurrentLine(line);
         setIsNarrating(false);
-
         const audioKey = getAudioKey(sceneIndex, scriptIndex);
-        const buffer = audioCache.current.get(audioKey);
-
-        if (audioEnabled && buffer) {
-            playAudioBuffer(buffer, () => {
-                setTimeout(() => setScriptIndex(prev => prev + 1), 500); 
-            });
-        } else {
-            const duration = Math.max(2000, line.text.length * 80);
-            const timer = setTimeout(() => setScriptIndex(prev => prev + 1), duration);
-            return () => clearTimeout(timer);
-        }
+        
+        handlePlaybackStep(line.text, audioKey, () => {
+            setScriptIndex(prev => prev + 1);
+        });
     } 
     // C. End of Scene
     else if (scriptIndex >= currentScene.script.length) {
@@ -200,7 +238,7 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
              const nextIdx = sceneIndex + 1;
              prepareSceneAudio(nextIdx).then(() => {
                  setSceneIndex(nextIdx);
-                 setScriptIndex(-1); // Reset to narrator for next scene
+                 setScriptIndex(-1);
              });
         } else {
             setIsPlaying(false);
@@ -211,6 +249,7 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
 
   const handleRestart = () => {
     if (activeSourceRef.current) activeSourceRef.current.stop();
+    window.speechSynthesis.cancel();
     setSceneIndex(0);
     setScriptIndex(-1);
     setIsPlaying(true);
@@ -228,19 +267,25 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
            <div className="flex gap-2 text-sm text-slate-400">
              <span>Сцена {sceneIndex + 1} / {movie.scenes.length}</span>
              {isPreparingAudio && <span className="text-indigo-400 animate-pulse">• Загрузка аудио...</span>}
+             {movie.audioMode === 'browser' && <span className="text-green-400 text-xs px-2 py-0.5 border border-green-500/30 rounded">Lite Audio</span>}
            </div>
         </div>
         <div className="flex gap-2">
-            <button onClick={() => setAudioEnabled(!audioEnabled)} className="p-2 hover:bg-slate-800 rounded-full text-white transition">
+            <button onClick={() => {
+                setAudioEnabled(!audioEnabled);
+                if(audioEnabled) window.speechSynthesis.cancel();
+            }} className="p-2 hover:bg-slate-800 rounded-full text-white transition">
                 {audioEnabled ? <Volume2 size={20} /> : <VolumeX size={20} />}
             </button>
             <button onClick={() => {
                 if (isPlaying) {
                     setIsPlaying(false);
                     activeSourceRef.current?.stop();
+                    window.speechSynthesis.pause();
                 } else {
                     setIsPlaying(true);
                     if (audioCtxRef.current?.state === 'suspended') audioCtxRef.current.resume();
+                    window.speechSynthesis.resume();
                 }
             }} className="p-2 hover:bg-slate-800 rounded-full text-white transition">
                 {isPlaying ? <Pause size={20} /> : <Play size={20} />}
@@ -312,10 +357,6 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
 
             {/* Dialogue Overlay */}
             {currentLine && (
-                // If in image mode, we don't know EXACT char position, so we position bottom center or roughly where we think they might be
-                // But generally centering speech bubbles at bottom is safer if we don't have coords.
-                // However, we DO have coords in the Scene object from generation, even if we don't render sprites.
-                // We can use those coords to place bubbles!
                 <div 
                     className="absolute transform -translate-x-1/2 -translate-y-full pb-6 pointer-events-none z-20 transition-all duration-300"
                     style={{ 
@@ -342,27 +383,18 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
       </div>
 
       <style>{`
-        .text-shadow {
-            text-shadow: 0 2px 4px rgba(0,0,0,0.8);
-        }
+        .text-shadow { text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
         @keyframes pop-in {
             0% { opacity: 0; transform: scale(0.8) translateY(10px); }
             100% { opacity: 1; transform: scale(1) translateY(0); }
         }
-        .animate-pop-in {
-            animation: pop-in 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
-        }
-
+        .animate-pop-in { animation: pop-in 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; }
         @keyframes pan-zoom {
             0% { transform: scale(1); }
             50% { transform: scale(1.05); }
             100% { transform: scale(1); }
         }
-        .animate-pan-zoom {
-            animation: pan-zoom 20s infinite ease-in-out alternate;
-        }
-
-        /* SVG Animations preserved */
+        .animate-pan-zoom { animation: pan-zoom 20s infinite ease-in-out alternate; }
         .anim-idle { animation: idle 3s infinite ease-in-out; }
         @keyframes idle {
             0%, 100% { transform: translate(-50%, -50%) scale(1); }

@@ -1,12 +1,16 @@
-export type VisualStyle = 'flat' | 'cartoon-3d' | 'cinematic' | 'hand-drawn' | 'pixel-art';
+export type VisualStyle = 'flat' | 'cartoon-3d' | 'cinematic' | 'hand-drawn' | 'pixel-art' | 'anime' | 'noir' | 'cyberpunk' | 'watercolor' | 'retro-game';
 
 export type GenerationMode = 'svg' | 'image';
+export type AudioMode = 'gemini' | 'browser'; // 'gemini' = AI High Quality, 'browser' = Free/Unlimited
+
+export type SceneCount = 3 | 5 | 8;
 
 export interface CharacterConfig {
   id: string;
   name: string;
   description: string;
-  voice?: string; // Voice name for TTS
+  voice?: string; 
+  referenceImageData?: string; // Base64 image for reference
 }
 
 export type AnimationType = 'idle' | 'float' | 'bounce' | 'shake' | 'walk' | 'pulse' | 'stretch' | 'wobble';
@@ -14,8 +18,8 @@ export type AnimationType = 'idle' | 'float' | 'bounce' | 'shake' | 'walk' | 'pu
 export interface Character {
   id: string;
   name: string;
-  svgBody?: string; // Used in SVG mode
-  imageUrl?: string; // Used in Image mode
+  svgBody?: string;
+  imageUrl?: string;
   x: number; 
   y: number; 
   scale: number; 
@@ -31,8 +35,8 @@ export interface DialogueLine {
 export interface Scene {
   id: string;
   duration: number; 
-  backgroundSvg?: string; // Used in SVG mode
-  backgroundImageUrl?: string; // Used in Image mode
+  backgroundSvg?: string; 
+  backgroundImageUrl?: string; 
   backgroundColor: string; 
   description: string;
   characters: Character[];
@@ -44,6 +48,7 @@ export interface Movie {
   summary: string;
   style: VisualStyle;
   mode: GenerationMode;
+  audioMode: AudioMode;
   scenes: Scene[];
 }
 
