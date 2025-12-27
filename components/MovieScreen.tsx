@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { Movie, Scene, DialogueLine } from '../types';
-import { Play, Pause, RotateCcw, Volume2, VolumeX } from 'lucide-react';
+import { Play, Pause, RotateCcw, Volume2, VolumeX, Maximize, Minimize } from 'lucide-react';
 import { generateSpeech } from '../services/geminiService';
 
 interface MovieScreenProps {
@@ -47,6 +47,10 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
   const [isNarrating, setIsNarrating] = useState(false);
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [isPreparingAudio, setIsPreparingAudio] = useState(false);
+  
+  // Fullscreen state
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const activeSourceRef = useRef<AudioBufferSourceNode | null>(null);
@@ -61,23 +65,13 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
         return;
     }
     
-    // Cancel previous
     window.speechSynthesis.cancel();
-
     const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = 'ru-RU'; // Default to Russian
+    utterance.lang = 'ru-RU';
     utterance.rate = 1.0;
-
-    // Try to vary pitch based on character if possible, but basic browser TTS is limited
-    // We can try to pick a voice, but it's flaky across browsers.
-    // For now, standard voice.
     
-    utterance.onend = () => {
-        onEnd();
-    };
-    utterance.onerror = () => {
-        onEnd();
-    };
+    utterance.onend = () => { onEnd(); };
+    utterance.onerror = () => { onEnd(); };
 
     window.speechSynthesis.speak(utterance);
   };
@@ -94,6 +88,34 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
     };
   }, [movie.audioMode]);
 
+  // Fullscreen toggle handler
+  const toggleFullscreen = async () => {
+      if (!containerRef.current) return;
+
+      try {
+          if (!document.fullscreenElement) {
+              await containerRef.current.requestFullscreen();
+              setIsFullscreen(true);
+          } else {
+              await document.exitFullscreen();
+              setIsFullscreen(false);
+          }
+      } catch (err) {
+          console.error("Fullscreen error:", err);
+          // Fallback to state-based CSS toggle if API fails
+          setIsFullscreen(!isFullscreen);
+      }
+  };
+
+  // Sync fullscreen state with browser events (e.g. Esc key)
+  useEffect(() => {
+      const handleFsChange = () => {
+          setIsFullscreen(document.fullscreenElement === containerRef.current);
+      };
+      document.addEventListener('fullscreenchange', handleFsChange);
+      return () => document.removeEventListener('fullscreenchange', handleFsChange);
+  }, []);
+
   const getAudioKey = (sIdx: number, lIdx: number) => {
       if (lIdx === -1) return `${movie.scenes[sIdx].id}-narrator`; 
       return `${movie.scenes[sIdx].id}-line-${lIdx}`;
@@ -105,7 +127,6 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
     if (!s) return;
 
     if (movie.audioMode === 'browser') {
-        // No pre-loading needed for browser TTS
         setIsPreparingAudio(false);
         return;
     }
@@ -258,12 +279,22 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
   const activeChar = currentLine ? scene.characters.find(c => c.id === currentLine.characterId) : null;
 
   return (
-    <div className="w-full max-w-4xl mx-auto bg-black rounded-2xl overflow-hidden shadow-2xl shadow-indigo-500/20 border border-slate-800 flex flex-col">
+    <div 
+        ref={containerRef}
+        className={`${
+            isFullscreen 
+                ? 'fixed inset-0 z-50 w-full h-full rounded-none' 
+                : 'w-full max-w-4xl mx-auto rounded-2xl relative'
+        } bg-black overflow-hidden shadow-2xl shadow-indigo-500/20 border border-slate-800 flex flex-col transition-all duration-300 group`}
+    >
       
-      {/* Title Bar */}
-      <div className="bg-slate-900 p-4 border-b border-slate-800 flex justify-between items-center">
+      {/* Title Bar & Controls */}
+      <div className={`
+          bg-slate-900 p-4 border-b border-slate-800 flex justify-between items-center shrink-0 transition-all duration-300
+          ${isFullscreen ? 'absolute top-0 left-0 right-0 z-30 bg-slate-900/80 backdrop-blur opacity-0 group-hover:opacity-100 border-none' : ''}
+      `}>
         <div>
-           <h2 className="text-xl font-bold text-white">{movie.title}</h2>
+           <h2 className="text-xl font-bold text-white shadow-black drop-shadow-md">{movie.title}</h2>
            <div className="flex gap-2 text-sm text-slate-400">
              <span>Сцена {sceneIndex + 1} / {movie.scenes.length}</span>
              {isPreparingAudio && <span className="text-indigo-400 animate-pulse">• Загрузка аудио...</span>}
@@ -274,7 +305,7 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
             <button onClick={() => {
                 setAudioEnabled(!audioEnabled);
                 if(audioEnabled) window.speechSynthesis.cancel();
-            }} className="p-2 hover:bg-slate-800 rounded-full text-white transition">
+            }} className="p-2 hover:bg-slate-800/80 rounded-full text-white transition backdrop-blur-sm">
                 {audioEnabled ? <Volume2 size={20} /> : <VolumeX size={20} />}
             </button>
             <button onClick={() => {
@@ -287,17 +318,21 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
                     if (audioCtxRef.current?.state === 'suspended') audioCtxRef.current.resume();
                     window.speechSynthesis.resume();
                 }
-            }} className="p-2 hover:bg-slate-800 rounded-full text-white transition">
+            }} className="p-2 hover:bg-slate-800/80 rounded-full text-white transition backdrop-blur-sm">
                 {isPlaying ? <Pause size={20} /> : <Play size={20} />}
             </button>
-            <button onClick={handleRestart} className="p-2 hover:bg-slate-800 rounded-full text-white transition">
+            <button onClick={handleRestart} className="p-2 hover:bg-slate-800/80 rounded-full text-white transition backdrop-blur-sm">
                 <RotateCcw size={20} />
+            </button>
+            <button onClick={toggleFullscreen} className="p-2 hover:bg-slate-800/80 rounded-full text-white transition backdrop-blur-sm ml-2 border-l border-white/10 pl-4">
+                {isFullscreen ? <Minimize size={20} /> : <Maximize size={20} />}
             </button>
         </div>
       </div>
 
       {/* Viewport */}
-      <div className="relative aspect-video w-full bg-slate-900 overflow-hidden">
+      {/* In Fullscreen we use flex-1 to fill space, otherwise fixed aspect ratio */}
+      <div className={`relative w-full bg-slate-900 overflow-hidden ${isFullscreen ? 'flex-1' : 'aspect-video'}`}>
         
         <div className="w-full h-full relative">
             
@@ -346,9 +381,9 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
 
             {/* Narrator Text Overlay */}
             {isNarrating && (
-                <div className="absolute inset-0 flex items-end justify-center pb-12 bg-gradient-to-t from-black/80 via-transparent to-transparent pointer-events-none">
-                     <div className="max-w-2xl text-center animate-fade-in px-4">
-                        <p className="text-xl md:text-2xl text-indigo-100 font-serif italic leading-relaxed text-shadow">
+                <div className="absolute inset-0 flex items-end justify-center pb-12 bg-gradient-to-t from-black/80 via-transparent to-transparent pointer-events-none z-20">
+                     <div className="max-w-4xl text-center animate-fade-in px-8">
+                        <p className={`text-indigo-100 font-serif italic leading-relaxed text-shadow ${isFullscreen ? 'text-3xl' : 'text-xl md:text-2xl'}`}>
                             "{scene.description}"
                         </p>
                      </div>
@@ -362,11 +397,11 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
                     style={{ 
                         left: activeChar ? `${activeChar.x}%` : '50%', 
                         top: activeChar ? `${activeChar.y - 15}%` : '80%',
-                        maxWidth: '40%',
-                        minWidth: '150px'
+                        maxWidth: isFullscreen ? '30%' : '40%',
+                        minWidth: '200px'
                     }}
                 >
-                    <div className="animate-pop-in bg-white text-black p-4 rounded-2xl rounded-bl-none shadow-xl border-2 border-black comic-font text-base md:text-lg leading-tight relative">
+                    <div className={`animate-pop-in bg-white text-black p-4 rounded-2xl rounded-bl-none shadow-xl border-2 border-black comic-font leading-tight relative ${isFullscreen ? 'text-2xl' : 'text-base md:text-lg'}`}>
                         {currentLine.text}
                         <div className="absolute -bottom-2 left-4 w-4 h-4 bg-white border-b-2 border-r-2 border-black transform rotate-45"></div>
                     </div>
@@ -375,7 +410,8 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
         </div>
       </div>
 
-      <div className="h-1 bg-slate-800 w-full relative">
+      {/* Progress Bar */}
+      <div className={`h-1 bg-slate-800 w-full relative shrink-0 ${isFullscreen ? 'absolute bottom-0 left-0 right-0 z-30' : ''}`}>
          <div 
             className="h-full bg-indigo-500 transition-all duration-300"
             style={{ width: `${((sceneIndex) / movie.scenes.length) * 100}%` }}
