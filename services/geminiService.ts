@@ -12,7 +12,6 @@ const NARRATOR_VOICE = 'Fenrir';
 
 const safeJsonParse = <T>(text: string): T => {
   if (!text) throw new Error("AI returned empty response");
-  // Clean markdown
   let cleanText = text.replace(/```json\n?|```/g, '').trim();
   try {
     return JSON.parse(cleanText) as T;
@@ -29,14 +28,12 @@ const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 // --- SCHEMAS ---
 
-// 1. NORMALIZED STORY SCHEMA (Structure Only)
-// Removed characterLayout as we rely on the image model to place characters based on description
 const getNormalizedStorySchema = (isCustomAudio: boolean): Schema => {
   
   const sceneProperties: Record<string, Schema> = {
     id: { type: Type.STRING },
     duration: { type: Type.NUMBER },
-    description: { type: Type.STRING, description: "Detailed visual description of the scene in Russian. Mention characters by name if they appear." },
+    description: { type: Type.STRING, description: "Detailed visual description of the scene. Mention characters by name if they appear." },
     charactersInScene: {
         type: Type.ARRAY,
         description: "List of Character IDs present in this scene.",
@@ -57,7 +54,7 @@ const getNormalizedStorySchema = (isCustomAudio: boolean): Schema => {
             type: Type.OBJECT,
             properties: {
               characterId: { type: Type.STRING },
-              text: { type: Type.STRING, description: "Russian dialogue text." }
+              text: { type: Type.STRING, description: "Dialogue text." }
             },
             required: ["characterId", "text"]
           }
@@ -68,8 +65,8 @@ const getNormalizedStorySchema = (isCustomAudio: boolean): Schema => {
   return {
     type: Type.OBJECT,
     properties: {
-      title: { type: Type.STRING, description: "Название фильма на русском" },
-      summary: { type: Type.STRING, description: "Краткое описание на русском" },
+      title: { type: Type.STRING, description: "Movie title" },
+      summary: { type: Type.STRING, description: "Short summary" },
       cast: {
         type: Type.ARRAY,
         description: "List of all characters appearing in the movie.",
@@ -77,7 +74,7 @@ const getNormalizedStorySchema = (isCustomAudio: boolean): Schema => {
           type: Type.OBJECT,
           properties: {
             id: { type: Type.STRING },
-            name: { type: Type.STRING, description: "Russian name" },
+            name: { type: Type.STRING, description: "Name" },
             description: { type: Type.STRING, description: "Visual appearance description." }
           },
           required: ["id", "name", "description"]
@@ -135,6 +132,32 @@ const generateImage = async (prompt: string, aspectRatio: AspectRatio, reference
     return undefined;
 };
 
+// --- AUDIO GENERATION HELPERS ---
+
+export const generateSpeech = async (text: string, voiceName: string): Promise<string | undefined> => {
+  const maxRetries = 3;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      const response = await genAI.models.generateContent({
+        model: "gemini-2.5-flash-preview-tts",
+        contents: [{ parts: [{ text }] }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName || 'Puck' } } },
+        },
+      });
+      return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    } catch (e: any) {
+      if (e.message?.includes('429') || e.status === 429) {
+        await delay((i + 1) * 2000); // Increased backoff
+        continue;
+      }
+      return undefined;
+    }
+  }
+  return undefined;
+};
+
 // --- DATA HYDRATION ---
 
 const hydrateMovieFromNormalized = (normalizedData: any, style: VisualStyle, audioMode: AudioMode, aspectRatio: AspectRatio): Movie => {
@@ -173,26 +196,40 @@ const hydrateMovieFromNormalized = (normalizedData: any, style: VisualStyle, aud
     };
 };
 
+export const assignVoices = (movie: Movie, configs: CharacterConfig[]) => {
+    const charMap = new Map<string, string>();
+    configs.forEach(c => { if(c.voice) charMap.set(c.id, c.voice); });
+
+    const guessVoice = (name: string): string => {
+        if (!name) return MALE_VOICES[0];
+        const lower = name.toLowerCase();
+        if (lower.endsWith('а') || lower.endsWith('я') || lower.endsWith('a') || lower.endsWith('ya')) {
+            return FEMALE_VOICES[Math.floor(Math.random() * FEMALE_VOICES.length)];
+        }
+        return MALE_VOICES[Math.floor(Math.random() * MALE_VOICES.length)];
+    };
+
+    movie.scenes.forEach(s => {
+        s.characters.forEach(c => {
+            if (charMap.has(c.id)) return;
+            const voice = guessVoice(c.name);
+            charMap.set(c.id, voice);
+        });
+    });
+    charMap.set('narrator', NARRATOR_VOICE);
+    return charMap;
+};
+
 // --- ORCHESTRATORS ---
 
 const enrichScenesWithVisuals = async (movie: Movie, characterConfigs: CharacterConfig[]) => {
-    // Collect all character references
     const allRefs = characterConfigs.filter(c => c.referenceImageData).map(c => c.referenceImageData!);
     const styleInstruction = getStyleInstructions(movie.style);
-
-    // Create a context string for the cast to help the image generator know who is who
-    // We can pass this as part of the prompt
     
     const promises = movie.scenes.map(async (scene) => {
-        // Construct a rich prompt for the image generator
         let prompt = `${styleInstruction} Scene: ${scene.description}.`;
         
-        // Add character descriptions if they are in the scene
         if (scene.characters.length > 0) {
-             // We need to look up the description from the "cast" (which we don't have direct access to here easily unless we passed it down, 
-             // or we can rely on the scene description being detailed enough).
-             // To fix this properly, let's rely on the AI's scene description being good, 
-             // but append the character config descriptions if available.
              const charsInScene = scene.characters.map(c => {
                  const config = characterConfigs.find(conf => conf.id === c.id);
                  return config ? `${config.name} (${config.description})` : c.name;
@@ -210,31 +247,32 @@ const enrichScenesWithVisuals = async (movie: Movie, characterConfigs: Character
     return movie;
 };
 
-// --- EXPORTED FUNCTIONS ---
+// NEW: Pre-generate all audio
+const enrichScenesWithAudio = async (movie: Movie, voices: Map<string, string>) => {
+    if (movie.audioMode !== 'gemini') return movie;
 
-export const generateSpeech = async (text: string, voiceName: string): Promise<string | undefined> => {
-  const maxRetries = 3;
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      const response = await genAI.models.generateContent({
-        model: "gemini-2.5-flash-preview-tts",
-        contents: [{ parts: [{ text }] }],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName || 'Puck' } } },
-        },
-      });
-      return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    } catch (e: any) {
-      if (e.message?.includes('429') || e.status === 429) {
-        await delay((i + 1) * 1500);
-        continue;
-      }
-      return undefined;
+    // Generate Narration for scenes
+    for (const scene of movie.scenes) {
+        if (scene.description) {
+            const audio = await generateSpeech(scene.description, voices.get('narrator') || 'Fenrir');
+            if (audio) scene.narrationAudioData = audio;
+        }
+        await delay(500); // Rate limit protection
     }
-  }
-  return undefined;
+
+    // Generate Dialogue
+    for (const scene of movie.scenes) {
+        for (const line of scene.script) {
+            const voice = voices.get(line.characterId) || 'Puck';
+            const audio = await generateSpeech(line.text, voice);
+            if (audio) line.audioData = audio;
+            await delay(500); // Rate limit protection
+        }
+    }
+    return movie;
 };
+
+// --- EXPORTED FUNCTIONS ---
 
 export const generateMovie = async (
   prompt: string, 
@@ -254,29 +292,40 @@ export const generateMovie = async (
   // STEP 1: Generate Structure
   const response = await genAI.models.generateContent({
     model: "gemini-3-flash-preview",
-    contents: `Write a movie script JSON in RUSSIAN language.
+    contents: `Write a movie script JSON.
     Prompt: "${prompt}".
     Scene Count: ${sceneCount}.
     Style: ${style}. Ratio: ${aspectRatio}.
     ${characterContext}
     
-    IMPORTANT: Provide a 'cast' list first, then 'scenes'.
-    For each scene, provide a 'description' that is extremely visual and detailed, suitable for an image generator. 
-    List characters present in 'charactersInScene'.
+    IMPORTANT RULES:
+    1. DETECT THE LANGUAGE of the Prompt. The 'description', 'summary', 'name', and 'text' fields MUST BE in that detected language.
+    2. Provide a 'cast' list first, then 'scenes'.
+    3. For each scene, provide a 'description' that is extremely visual and detailed.
+    4. List characters present in 'charactersInScene'.
     `,
     config: {
       responseMimeType: "application/json",
       responseSchema: getNormalizedStorySchema(false),
-      systemInstruction: "You are a screenwriter. Output strict JSON. Language: Russian.",
+      systemInstruction: "You are a multilingual screenwriter. You output strict JSON. You adapt to the language of the user's prompt.",
       maxOutputTokens: 8192
     }
   });
 
   const normalizedData = safeJsonParse<any>(response.text);
   const movieData = hydrateMovieFromNormalized(normalizedData, style, audioMode, aspectRatio);
+  const voices = assignVoices(movieData, characterConfigs);
 
-  // STEP 2: Generate Visuals
-  return await enrichScenesWithVisuals(movieData, characterConfigs);
+  // STEP 2: Generate Visuals & Audio Parallel-ish
+  // We await visuals first, then audio, to ensure we don't hit rate limits too hard simultaneously
+  await enrichScenesWithVisuals(movieData, characterConfigs);
+  
+  // STEP 3: Generate Audio (if needed)
+  if (audioMode === 'gemini') {
+      await enrichScenesWithAudio(movieData, voices);
+  }
+
+  return movieData;
 };
 
 export const generateMovieFromAudio = async (
@@ -299,14 +348,15 @@ export const generateMovieFromAudio = async (
                 ${characterConfigs.length > 0 ? 'Detect these characters: ' + characterConfigs.map(c=>c.name).join(', ') : ''}
                 
                 Return JSON with 'cast' and 'scenes'. 
-                The 'description' must be a detailed prompt for an image generator (in Russian).
+                DETECT LANGUAGE of the audio. The 'description' and text MUST be in the same language as the audio.
+                The 'description' must be a detailed prompt for an image generator.
                 `
             }
         ],
         config: {
             responseMimeType: "application/json",
             responseSchema: getNormalizedStorySchema(true),
-            systemInstruction: "Video editor assistant. Output strict JSON in Russian.",
+            systemInstruction: "Video editor assistant. Output strict JSON in the language of the audio.",
             maxOutputTokens: 8192
         }
     });
@@ -333,7 +383,8 @@ export const generateSceneFromPrompt = async (prompt: string, currentMovie: Movi
 
     const sceneResponse = await genAI.models.generateContent({
         model: "gemini-3-flash-preview",
-        contents: `Generate ONE scene in RUSSIAN. Context: ${currentMovie.title}. Style: ${currentMovie.style}. Prompt: "${prompt}".`,
+        contents: `Generate ONE scene. Context: ${currentMovie.title}. Style: ${currentMovie.style}. Prompt: "${prompt}".
+        Detect language of the prompt and use it for output.`,
         config: { 
           responseMimeType: "application/json", 
           responseSchema: singleSceneSchema,
@@ -348,32 +399,15 @@ export const generateSceneFromPrompt = async (prompt: string, currentMovie: Movi
     const bgImage = await generateImage(fullPrompt, currentMovie.aspectRatio);
     if (bgImage) scene.backgroundImageUrl = bgImage;
     
-    // Initialize empty chars for safety
-    scene.characters = []; 
+    // Generate Audio if Gemeni mode
+    if (currentMovie.audioMode === 'gemini') {
+         if (scene.description) {
+             scene.narrationAudioData = await generateSpeech(scene.description, 'Fenrir');
+         }
+         // Note: We are not auto-generating dialogue audio here for single scene edits to save time/tokens, 
+         // but could be added if needed.
+    }
     
+    scene.characters = []; 
     return scene;
 }
-
-export const assignVoices = (movie: Movie, configs: CharacterConfig[]) => {
-    const charMap = new Map<string, string>();
-    configs.forEach(c => { if(c.voice) charMap.set(c.id, c.voice); });
-
-    const guessVoice = (name: string): string => {
-        if (!name) return MALE_VOICES[0];
-        const lower = name.toLowerCase();
-        if (lower.endsWith('а') || lower.endsWith('я') || lower.endsWith('a') || lower.endsWith('ya')) {
-            return FEMALE_VOICES[Math.floor(Math.random() * FEMALE_VOICES.length)];
-        }
-        return MALE_VOICES[Math.floor(Math.random() * MALE_VOICES.length)];
-    };
-
-    movie.scenes.forEach(s => {
-        s.characters.forEach(c => {
-            if (charMap.has(c.id)) return;
-            const voice = guessVoice(c.name);
-            charMap.set(c.id, voice);
-        });
-    });
-    charMap.set('narrator', NARRATOR_VOICE);
-    return charMap;
-};

@@ -1,7 +1,6 @@
 
 export type VisualStyle = 'flat' | 'cartoon-3d' | 'cinematic' | 'hand-drawn' | 'pixel-art' | 'anime' | 'noir' | 'cyberpunk' | 'watercolor' | 'retro-game';
 
-// Removed GenerationMode as we only support Image now
 export type AudioMode = 'gemini' | 'browser' | 'custom'; // 'custom' = User Uploaded
 
 export type AspectRatio = '16:9' | '9:16' | '1:1' | '4:5' | '21:9';
@@ -19,13 +18,12 @@ export interface CharacterConfig {
 export interface Character {
   id: string;
   name: string;
-  // Removed visual props (x, y, scale, svgBody) as they are now baked into the background image
 }
 
 export interface DialogueLine {
   characterId: string;
   text: string;
-  audioData?: string; // Base64 audio
+  audioData?: string; // Base64 audio (Pre-generated)
 }
 
 export interface Scene {
@@ -36,6 +34,7 @@ export interface Scene {
   backgroundImageUrl?: string; 
   backgroundColor?: string; // Fallback
   description: string;
+  narrationAudioData?: string; // Base64 audio for the description (Pre-generated)
   characters: Character[]; // List of characters present in this scene (for context)
   script: DialogueLine[]; 
 }
@@ -51,7 +50,7 @@ export interface Movie {
 }
 
 export interface GenerationState {
-  status: 'idle' | 'generating' | 'playing' | 'editing' | 'finished' | 'error';
+  status: 'idle' | 'generating' | 'playing' | 'editing' | 'finished' | 'error' | 'rendering';
   error?: string;
   loadingMessage?: string;
 }
