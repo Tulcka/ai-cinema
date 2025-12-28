@@ -1,7 +1,10 @@
+
 export type VisualStyle = 'flat' | 'cartoon-3d' | 'cinematic' | 'hand-drawn' | 'pixel-art' | 'anime' | 'noir' | 'cyberpunk' | 'watercolor' | 'retro-game';
 
-export type GenerationMode = 'svg' | 'image';
-export type AudioMode = 'gemini' | 'browser'; // 'gemini' = AI High Quality, 'browser' = Free/Unlimited
+// Removed GenerationMode as we only support Image now
+export type AudioMode = 'gemini' | 'browser' | 'custom'; // 'custom' = User Uploaded
+
+export type AspectRatio = '16:9' | '9:16' | '1:1' | '4:5' | '21:9';
 
 export type SceneCount = 3 | 5 | 8;
 
@@ -13,17 +16,10 @@ export interface CharacterConfig {
   referenceImageData?: string; // Base64 image for reference
 }
 
-export type AnimationType = 'idle' | 'float' | 'bounce' | 'shake' | 'walk' | 'pulse' | 'stretch' | 'wobble';
-
 export interface Character {
   id: string;
   name: string;
-  svgBody?: string;
-  imageUrl?: string;
-  x: number; 
-  y: number; 
-  scale: number; 
-  animation: AnimationType;
+  // Removed visual props (x, y, scale, svgBody) as they are now baked into the background image
 }
 
 export interface DialogueLine {
@@ -34,12 +30,13 @@ export interface DialogueLine {
 
 export interface Scene {
   id: string;
-  duration: number; 
-  backgroundSvg?: string; 
+  duration: number; // Duration in seconds
+  startTime?: number; // Start time in seconds (for custom audio sync)
+  endTime?: number;   // End time in seconds (for custom audio sync)
   backgroundImageUrl?: string; 
-  backgroundColor: string; 
+  backgroundColor?: string; // Fallback
   description: string;
-  characters: Character[];
+  characters: Character[]; // List of characters present in this scene (for context)
   script: DialogueLine[]; 
 }
 
@@ -47,8 +44,9 @@ export interface Movie {
   title: string;
   summary: string;
   style: VisualStyle;
-  mode: GenerationMode;
   audioMode: AudioMode;
+  aspectRatio: AspectRatio;
+  customAudioData?: string; // Base64 of the uploaded user file
   scenes: Scene[];
 }
 

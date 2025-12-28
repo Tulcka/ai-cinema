@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { Movie, Scene, DialogueLine } from '../types';
+import { Movie, DialogueLine, AspectRatio } from '../types';
 import { Play, Pause, RotateCcw, Volume2, VolumeX, Maximize, Minimize } from 'lucide-react';
 import { generateSpeech } from '../services/geminiService';
 
@@ -39,6 +39,17 @@ async function decodeAudioData(
   return buffer;
 }
 
+const getAspectRatioStyle = (ratio: AspectRatio): React.CSSProperties => {
+    switch (ratio) {
+        case '16:9': return { aspectRatio: '16/9' };
+        case '9:16': return { aspectRatio: '9/16' };
+        case '1:1': return { aspectRatio: '1/1' };
+        case '4:5': return { aspectRatio: '4/5' };
+        case '21:9': return { aspectRatio: '21/9' };
+        default: return { aspectRatio: '16/9' };
+    }
+};
+
 export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinish }) => {
   const [sceneIndex, setSceneIndex] = useState(0);
   const [scriptIndex, setScriptIndex] = useState(-2); 
@@ -48,6 +59,9 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [isPreparingAudio, setIsPreparingAudio] = useState(false);
   
+  // Custom Audio State
+  const customAudioRef = useRef<HTMLAudioElement | null>(null);
+
   // Fullscreen state
   const [isFullscreen, setIsFullscreen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -85,29 +99,28 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
       activeSourceRef.current?.stop();
       audioCtxRef.current?.close();
       window.speechSynthesis.cancel();
+      if (customAudioRef.current) {
+          customAudioRef.current.pause();
+      }
     };
   }, [movie.audioMode]);
 
-  // Fullscreen toggle handler
   const toggleFullscreen = async () => {
       if (!containerRef.current) return;
-
       try {
           if (!document.fullscreenElement) {
               await containerRef.current.requestFullscreen();
-              setIsFullscreen(true);
+              // State update is handled by event listener
           } else {
               await document.exitFullscreen();
-              setIsFullscreen(false);
+              // State update is handled by event listener
           }
       } catch (err) {
-          console.error("Fullscreen error:", err);
-          // Fallback to state-based CSS toggle if API fails
+          console.error(err);
           setIsFullscreen(!isFullscreen);
       }
   };
 
-  // Sync fullscreen state with browser events (e.g. Esc key)
   useEffect(() => {
       const handleFsChange = () => {
           setIsFullscreen(document.fullscreenElement === containerRef.current);
@@ -121,12 +134,12 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
       return `${movie.scenes[sIdx].id}-line-${lIdx}`;
   };
 
-  // Pre-fetch Audio (Only for Gemini Mode)
+  // --- PREPARE AUDIO (GENERATED MODE) ---
   const prepareSceneAudio = async (idx: number) => {
     const s = movie.scenes[idx];
     if (!s) return;
 
-    if (movie.audioMode === 'browser') {
+    if (movie.audioMode === 'browser' || movie.audioMode === 'custom') {
         setIsPreparingAudio(false);
         return;
     }
@@ -137,7 +150,6 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
 
     setIsPreparingAudio(true);
 
-    // 1. Narrator
     const narrKey = getAudioKey(idx, -1);
     if (!audioCache.current.has(narrKey) && s.description) {
         const narrAudio = await generateSpeech(s.description, voices.get('narrator') || 'Fenrir');
@@ -145,10 +157,8 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
              const buffer = await decodeAudioData(decode(narrAudio), audioCtxRef.current, 24000, 1);
              audioCache.current.set(narrKey, buffer);
         }
-        await new Promise(r => setTimeout(r, 500)); 
     }
 
-    // 2. Script
     for (let lIdx = 0; lIdx < s.script.length; lIdx++) {
       const line = s.script[lIdx];
       const key = getAudioKey(idx, lIdx);
@@ -162,26 +172,64 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
         try {
             const buffer = await decodeAudioData(decode(audioBase64), audioCtxRef.current, 24000, 1);
             audioCache.current.set(key, buffer);
-        } catch (err) {
-            console.error("Audio decoding failed", err);
-        }
+        } catch (err) { console.error(err) }
       }
       await new Promise(r => setTimeout(r, 800)); 
     }
-
     setIsPreparingAudio(false);
   };
 
+  // --- CUSTOM AUDIO SYNC LOOP ---
+  useEffect(() => {
+      if (movie.audioMode !== 'custom' || !customAudioRef.current) return;
+
+      const audio = customAudioRef.current;
+      
+      const handleTimeUpdate = () => {
+          const t = audio.currentTime;
+          const activeIndex = movie.scenes.findIndex(s => {
+              const start = s.startTime ?? 0;
+              const end = s.endTime ?? Infinity;
+              return t >= start && t < end;
+          });
+
+          if (activeIndex !== -1 && activeIndex !== sceneIndex) {
+              setSceneIndex(activeIndex);
+          }
+
+          const lastScene = movie.scenes[movie.scenes.length - 1];
+          if (lastScene.endTime && t >= lastScene.endTime) {
+              setIsPlaying(false);
+              onFinish();
+          }
+      };
+
+      audio.addEventListener('timeupdate', handleTimeUpdate);
+      audio.addEventListener('ended', () => { setIsPlaying(false); onFinish(); });
+
+      if (isPlaying) audio.play();
+      else audio.pause();
+
+      return () => {
+          audio.removeEventListener('timeupdate', handleTimeUpdate);
+      };
+  }, [movie.audioMode, isPlaying, movie.scenes, sceneIndex]);
+
   // Initial Load
   useEffect(() => {
-    prepareSceneAudio(0).then(() => {
+    if (movie.audioMode !== 'custom') {
+        prepareSceneAudio(0).then(() => {
+            setIsPlaying(true);
+            setScriptIndex(-1);
+        });
+    } else {
         setIsPlaying(true);
-        setScriptIndex(-1);
-    });
+    }
   }, []);
 
-  // Main Playback Loop
+  // --- GENERATED AUDIO LOOP ---
   useEffect(() => {
+    if (movie.audioMode === 'custom') return; 
     if (!isPlaying || isPreparingAudio) return;
 
     const currentScene = movie.scenes[sceneIndex];
@@ -215,21 +263,19 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
                 setTimeout(nextStep, 500);
             });
         } else {
-            // Gemini Audio
             const buffer = audioCache.current.get(audioKey);
             if (buffer) {
                 playAudioBuffer(buffer, () => {
                     setTimeout(nextStep, 500);
                 });
             } else {
-                // Fallback if audio gen failed
                 const duration = Math.max(2000, text.length * 60);
                 setTimeout(nextStep, duration);
             }
         }
     };
 
-    // A. Narrator Phase
+    // A. Narrator
     if (scriptIndex === -1) {
         setCurrentLine(null);
         setIsNarrating(true);
@@ -241,7 +287,7 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
             setScriptIndex(0);
         });
     } 
-    // B. Dialogue Phase
+    // B. Dialogue
     else if (scriptIndex >= 0 && scriptIndex < currentScene.script.length) {
         const line = currentScene.script[scriptIndex];
         setCurrentLine(line);
@@ -266,59 +312,56 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
             onFinish();
         }
     }
-  }, [isPlaying, isPreparingAudio, sceneIndex, scriptIndex, audioEnabled]);
+  }, [isPlaying, isPreparingAudio, sceneIndex, scriptIndex, audioEnabled, movie.audioMode]);
 
   const handleRestart = () => {
     if (activeSourceRef.current) activeSourceRef.current.stop();
+    if (customAudioRef.current) {
+        customAudioRef.current.currentTime = 0;
+        customAudioRef.current.play();
+    }
     window.speechSynthesis.cancel();
     setSceneIndex(0);
     setScriptIndex(-1);
     setIsPlaying(true);
   };
 
-  const activeChar = currentLine ? scene.characters.find(c => c.id === currentLine.characterId) : null;
-
   return (
     <div 
         ref={containerRef}
         className={`${
             isFullscreen 
-                ? 'fixed inset-0 z-50 w-full h-full rounded-none' 
-                : 'w-full max-w-4xl mx-auto rounded-2xl relative'
-        } bg-black overflow-hidden shadow-2xl shadow-indigo-500/20 border border-slate-800 flex flex-col transition-all duration-300 group`}
+                ? 'fixed inset-0 z-50 w-screen h-screen bg-black flex flex-col justify-center items-center' 
+                : 'w-full max-w-4xl mx-auto rounded-2xl relative bg-black flex flex-col'
+        } shadow-2xl shadow-indigo-500/20 border border-slate-800 transition-all duration-300 group`}
     >
       
-      {/* Title Bar & Controls */}
+      {/* Hidden Audio Element for Custom Mode */}
+      {movie.audioMode === 'custom' && movie.customAudioData && (
+          <audio 
+             ref={customAudioRef} 
+             src={`data:audio/mp3;base64,${movie.customAudioData}`} 
+             muted={!audioEnabled}
+          />
+      )}
+
+      {/* Controls Overlay (Top) */}
       <div className={`
-          bg-slate-900 p-4 border-b border-slate-800 flex justify-between items-center shrink-0 transition-all duration-300
-          ${isFullscreen ? 'absolute top-0 left-0 right-0 z-30 bg-slate-900/80 backdrop-blur opacity-0 group-hover:opacity-100 border-none' : ''}
+          bg-slate-900 p-4 border-b border-slate-800 flex justify-between items-center shrink-0 z-40
+          ${isFullscreen ? 'absolute top-0 left-0 w-full bg-slate-900/80 backdrop-blur opacity-0 group-hover:opacity-100 border-none transition-opacity' : 'w-full'}
       `}>
         <div>
-           <h2 className="text-xl font-bold text-white shadow-black drop-shadow-md">{movie.title}</h2>
+           <h2 className="text-xl font-bold text-white shadow-black drop-shadow-md truncate max-w-[200px] md:max-w-md">{movie.title}</h2>
            <div className="flex gap-2 text-sm text-slate-400">
              <span>Сцена {sceneIndex + 1} / {movie.scenes.length}</span>
-             {isPreparingAudio && <span className="text-indigo-400 animate-pulse">• Загрузка аудио...</span>}
-             {movie.audioMode === 'browser' && <span className="text-green-400 text-xs px-2 py-0.5 border border-green-500/30 rounded">Lite Audio</span>}
+             {movie.audioMode === 'custom' && <span className="text-yellow-400 text-xs px-2 py-0.5 border border-yellow-500/30 rounded">Custom Audio</span>}
            </div>
         </div>
         <div className="flex gap-2">
-            <button onClick={() => {
-                setAudioEnabled(!audioEnabled);
-                if(audioEnabled) window.speechSynthesis.cancel();
-            }} className="p-2 hover:bg-slate-800/80 rounded-full text-white transition backdrop-blur-sm">
+            <button onClick={() => setAudioEnabled(!audioEnabled)} className="p-2 hover:bg-slate-800/80 rounded-full text-white transition backdrop-blur-sm">
                 {audioEnabled ? <Volume2 size={20} /> : <VolumeX size={20} />}
             </button>
-            <button onClick={() => {
-                if (isPlaying) {
-                    setIsPlaying(false);
-                    activeSourceRef.current?.stop();
-                    window.speechSynthesis.pause();
-                } else {
-                    setIsPlaying(true);
-                    if (audioCtxRef.current?.state === 'suspended') audioCtxRef.current.resume();
-                    window.speechSynthesis.resume();
-                }
-            }} className="p-2 hover:bg-slate-800/80 rounded-full text-white transition backdrop-blur-sm">
+            <button onClick={() => setIsPlaying(!isPlaying)} className="p-2 hover:bg-slate-800/80 rounded-full text-white transition backdrop-blur-sm">
                 {isPlaying ? <Pause size={20} /> : <Play size={20} />}
             </button>
             <button onClick={handleRestart} className="p-2 hover:bg-slate-800/80 rounded-full text-white transition backdrop-blur-sm">
@@ -330,57 +373,29 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
         </div>
       </div>
 
-      {/* Viewport */}
-      {/* In Fullscreen we use flex-1 to fill space, otherwise fixed aspect ratio */}
-      <div className={`relative w-full bg-slate-900 overflow-hidden ${isFullscreen ? 'flex-1' : 'aspect-video'}`}>
-        
+      {/* Viewport Container */}
+      <div 
+        className={`relative overflow-hidden bg-slate-900 mx-auto transition-all duration-500 ${
+            isFullscreen ? 'max-w-full max-h-full' : 'w-full'
+        }`}
+        style={getAspectRatioStyle(movie.aspectRatio)}
+      >
         <div className="w-full h-full relative">
-            
-            {/* Background */}
-            {movie.mode === 'image' && scene.backgroundImageUrl ? (
+            {/* Background Image Only */}
+            {scene.backgroundImageUrl ? (
                 <img 
                     src={scene.backgroundImageUrl} 
                     className="absolute inset-0 w-full h-full object-cover animate-pan-zoom"
                     alt="background"
                 />
             ) : (
-                <svg viewBox="0 0 100 100" className="w-full h-full block absolute inset-0" style={{ backgroundColor: scene.backgroundColor }} preserveAspectRatio="xMidYMid slice">
-                     <g dangerouslySetInnerHTML={{ __html: scene.backgroundSvg || '' }} />
-                </svg>
+                <div className="w-full h-full bg-slate-800 flex items-center justify-center text-slate-500">
+                    Image Generating...
+                </div>
             )}
 
-            {/* Characters (SVG Mode Only) */}
-            {movie.mode === 'svg' && scene.characters.map((char, idx) => {
-                const isActive = activeChar && activeChar.id === char.id;
-                
-                const containerStyle: React.CSSProperties = {
-                    position: 'absolute',
-                    left: `${char.x}%`,
-                    top: `${char.y}%`,
-                    width: '20%',
-                    height: '20%',
-                    transform: `translate(-50%, -50%) scale(${char.scale || 1})`,
-                    transformOrigin: 'bottom center',
-                    zIndex: isActive ? 10 : 1
-                };
-
-                return (
-                    <div 
-                        key={char.id + idx}
-                        style={containerStyle}
-                        className={`transition-all duration-1000 ease-in-out anim-${char.animation || 'idle'}`}
-                    >
-                         <svg viewBox="0 0 20 20" className="w-full h-full overflow-visible">
-                            <g transform="translate(10, 10)">
-                                <g dangerouslySetInnerHTML={{ __html: char.svgBody || '' }} />
-                            </g>
-                         </svg>
-                    </div>
-                );
-            })}
-
-            {/* Narrator Text Overlay */}
-            {isNarrating && (
+            {/* Subtitles (For custom audio) or Narrator */}
+            {(isNarrating || (movie.audioMode === 'custom' && scene.script.length > 0)) && (
                 <div className="absolute inset-0 flex items-end justify-center pb-12 bg-gradient-to-t from-black/80 via-transparent to-transparent pointer-events-none z-20">
                      <div className="max-w-4xl text-center animate-fade-in px-8">
                         <p className={`text-indigo-100 font-serif italic leading-relaxed text-shadow ${isFullscreen ? 'text-3xl' : 'text-xl md:text-2xl'}`}>
@@ -391,19 +406,11 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
             )}
 
             {/* Dialogue Overlay */}
-            {currentLine && (
-                <div 
-                    className="absolute transform -translate-x-1/2 -translate-y-full pb-6 pointer-events-none z-20 transition-all duration-300"
-                    style={{ 
-                        left: activeChar ? `${activeChar.x}%` : '50%', 
-                        top: activeChar ? `${activeChar.y - 15}%` : '80%',
-                        maxWidth: isFullscreen ? '30%' : '40%',
-                        minWidth: '200px'
-                    }}
-                >
-                    <div className={`animate-pop-in bg-white text-black p-4 rounded-2xl rounded-bl-none shadow-xl border-2 border-black comic-font leading-tight relative ${isFullscreen ? 'text-2xl' : 'text-base md:text-lg'}`}>
+            {currentLine && movie.audioMode !== 'custom' && (
+                <div className="absolute bottom-10 left-1/2 transform -translate-x-1/2 z-20 w-full max-w-2xl px-4 pointer-events-none">
+                    <div className={`animate-pop-in bg-white/90 backdrop-blur text-black p-4 rounded-2xl shadow-xl border-2 border-black comic-font leading-tight text-center ${isFullscreen ? 'text-2xl' : 'text-lg'}`}>
+                        <span className="block text-xs font-bold text-indigo-600 mb-1 uppercase tracking-wider">{currentLine.characterId}</span>
                         {currentLine.text}
-                        <div className="absolute -bottom-2 left-4 w-4 h-4 bg-white border-b-2 border-r-2 border-black transform rotate-45"></div>
                     </div>
                 </div>
             )}
@@ -414,15 +421,15 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
       <div className={`h-1 bg-slate-800 w-full relative shrink-0 ${isFullscreen ? 'absolute bottom-0 left-0 right-0 z-30' : ''}`}>
          <div 
             className="h-full bg-indigo-500 transition-all duration-300"
-            style={{ width: `${((sceneIndex) / movie.scenes.length) * 100}%` }}
+            style={{ width: `${((sceneIndex + 1) / movie.scenes.length) * 100}%` }}
          />
       </div>
-
+      
       <style>{`
         .text-shadow { text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
         @keyframes pop-in {
-            0% { opacity: 0; transform: scale(0.8) translateY(10px); }
-            100% { opacity: 1; transform: scale(1) translateY(0); }
+            0% { opacity: 0; transform: translateY(10px); }
+            100% { opacity: 1; transform: translateY(0); }
         }
         .animate-pop-in { animation: pop-in 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; }
         @keyframes pan-zoom {
@@ -431,11 +438,6 @@ export const MovieScreen: React.FC<MovieScreenProps> = ({ movie, voices, onFinis
             100% { transform: scale(1); }
         }
         .animate-pan-zoom { animation: pan-zoom 20s infinite ease-in-out alternate; }
-        .anim-idle { animation: idle 3s infinite ease-in-out; }
-        @keyframes idle {
-            0%, 100% { transform: translate(-50%, -50%) scale(1); }
-            50% { transform: translate(-50%, -50%) translateY(-2%) scale(1.02); }
-        }
       `}</style>
     </div>
   );

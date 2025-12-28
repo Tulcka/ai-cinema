@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Movie, Scene } from '../types';
-import { Trash2, ArrowUp, ArrowDown, Clock, Plus, Sparkles, X, Volume2, StopCircle, Loader2 } from 'lucide-react';
+import { Trash2, ArrowUp, ArrowDown, Volume2, StopCircle, Plus, Sparkles, X, Loader2 } from 'lucide-react';
 import { generateSpeech, generateSceneFromPrompt } from '../services/geminiService';
 import { Button } from './Button';
 
@@ -10,7 +10,7 @@ interface SceneEditorProps {
   onClose: () => void;
 }
 
-// Helpers for PCM Decoding (duplicated from MovieScreen to keep components self-contained)
+// Helpers for PCM Decoding (duplicated)
 function decode(base64: string) {
   const binaryString = atob(base64);
   const len = binaryString.length;
@@ -173,19 +173,11 @@ export const SceneEditor: React.FC<SceneEditorProps> = ({ movie, onUpdateMovie, 
               <div key={sceneId} className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex items-center gap-4 hover:border-indigo-500/50 transition-colors">
                 
                 {/* Scene Preview (Mini) */}
-                <div className="w-24 h-16 bg-black rounded-lg overflow-hidden relative shrink-0 border border-slate-600">
-                  {movie.mode === 'image' && scene.backgroundImageUrl ? (
+                <div className="w-24 h-16 bg-slate-900 rounded-lg overflow-hidden relative shrink-0 border border-slate-600">
+                  {scene.backgroundImageUrl ? (
                       <img src={scene.backgroundImageUrl} className="w-full h-full object-cover" alt="scene" />
                   ) : (
-                      <svg viewBox="0 0 100 100" className="w-full h-full" style={{ backgroundColor: scene.backgroundColor }}>
-                          <g dangerouslySetInnerHTML={{ __html: scene.backgroundSvg || '' }} />
-                          {/* Only show svg characters in SVG mode */}
-                          {movie.mode === 'svg' && scene.characters.map((c, i) => (
-                            <g key={i} transform={`translate(${c.x}, ${c.y}) scale(0.5)`}>
-                                <g dangerouslySetInnerHTML={{ __html: c.svgBody || '' }} />
-                            </g>
-                          ))}
-                      </svg>
+                      <div className="w-full h-full flex items-center justify-center text-xs text-slate-500">Generating...</div>
                   )}
                   <div className="absolute top-0 left-0 bg-black/60 text-white text-[10px] px-1">
                     #{index + 1}

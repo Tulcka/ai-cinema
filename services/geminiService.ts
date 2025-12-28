@@ -1,5 +1,5 @@
 import { GoogleGenAI, Type, Schema, Modality } from "@google/genai";
-import { Movie, VisualStyle, CharacterConfig, Scene, GenerationMode, SceneCount, AudioMode } from "../types";
+import { Movie, VisualStyle, CharacterConfig, Scene, SceneCount, AudioMode, AspectRatio, Character } from "../types";
 
 const genAI = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
@@ -8,75 +8,209 @@ const MALE_VOICES = ['Puck', 'Charon', 'Fenrir'];
 const FEMALE_VOICES = ['Kore', 'Zephyr'];
 const NARRATOR_VOICE = 'Fenrir'; 
 
-const movieSchema: Schema = {
-  type: Type.OBJECT,
-  properties: {
-    title: { type: Type.STRING, description: "Название фильма на русском" },
-    summary: { type: Type.STRING, description: "Краткое описание сюжета на русском" },
-    scenes: {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          id: { type: Type.STRING },
-          duration: { type: Type.NUMBER },
-          backgroundColor: { type: Type.STRING },
-          backgroundSvg: { type: Type.STRING, description: "SVG контент фона (без внешнего тега svg). Используй <g>, <rect>, <circle>, <path> чтобы нарисовать детали окружения (деревья, дома, мебель). МИНИМУМ 10-20 фигур." },
-          description: { type: Type.STRING, description: "ПОЛНОЕ визуальное описание сцены." },
-          characters: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                id: { type: Type.STRING },
-                name: { type: Type.STRING },
-                svgBody: { type: Type.STRING, description: "SVG контент персонажа. ОБЯЗАТЕЛЬНО нарисуй: Голова, Тело, Руки/Ноги. Используй комбинацию простых фигур." },
-                x: { type: Type.NUMBER },
-                y: { type: Type.NUMBER },
-                scale: { type: Type.NUMBER },
-                animation: { type: Type.STRING, enum: ['idle', 'float', 'bounce', 'shake', 'walk', 'pulse', 'stretch', 'wobble'] }
-              },
-              required: ["id", "name", "svgBody", "x", "y", "scale", "animation"]
-            }
-          },
-          script: {
-            type: Type.ARRAY,
-            description: "Диалог персонажей. Минимум 2-4 реплики.",
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                characterId: { type: Type.STRING },
-                text: { type: Type.STRING }
-              },
-              required: ["characterId", "text"]
-            }
-          }
-        },
-        required: ["id", "duration", "backgroundColor", "backgroundSvg", "characters", "description", "script"]
-      }
-    }
-  },
-  required: ["title", "summary", "scenes"]
-};
+// --- HELPERS ---
 
-const getStyleInstructions = (style: VisualStyle): string => {
-  const prefix = "СТРОГО ПРИДЕРЖИВАЙСЯ СТИЛЯ:";
-  switch (style) {
-    case 'cartoon-3d': return `${prefix} 3D Pixar style, объемное освещение, яркие цвета.`;
-    case 'cinematic': return `${prefix} Кинематографичный реализм, драматичное освещение.`;
-    case 'hand-drawn': return `${prefix} Скетч от руки, небрежные линии.`;
-    case 'pixel-art': return `${prefix} Pixel Art, блочные формы.`;
-    case 'anime': return `${prefix} Аниме стиль.`;
-    case 'noir': return `${prefix} Нуар, высокий контраст.`;
-    case 'cyberpunk': return `${prefix} Киберпанк, неон, геометрия.`;
-    case 'watercolor': return `${prefix} Акварель.`;
-    case 'retro-game': return `${prefix} 8-bit games.`;
-    case 'flat':
-    default: return `${prefix} Flat Design, векторный минимализм.`;
+const safeJsonParse = <T>(text: string): T => {
+  if (!text) throw new Error("AI returned empty response");
+  // Clean markdown
+  let cleanText = text.replace(/```json\n?|```/g, '').trim();
+  try {
+    return JSON.parse(cleanText) as T;
+  } catch (e) {
+    console.error("JSON Parse Error. Text snippet:", cleanText.slice(-100));
+    if (e instanceof SyntaxError && (e.message.includes("Unterminated string") || e.message.includes("End of data") || e.message.includes("Expected"))) {
+       throw new Error("Response was cut off. The story is too long. Try fewer scenes.");
+    }
+    throw new Error("Failed to parse AI response. " + (e instanceof Error ? e.message : String(e)));
   }
 };
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// --- SCHEMAS ---
+
+// 1. NORMALIZED STORY SCHEMA (Structure Only)
+// Removed characterLayout as we rely on the image model to place characters based on description
+const getNormalizedStorySchema = (isCustomAudio: boolean): Schema => {
+  
+  const sceneProperties: Record<string, Schema> = {
+    id: { type: Type.STRING },
+    duration: { type: Type.NUMBER },
+    description: { type: Type.STRING, description: "Detailed visual description of the scene in Russian. Mention characters by name if they appear." },
+    charactersInScene: {
+        type: Type.ARRAY,
+        description: "List of Character IDs present in this scene.",
+        items: { type: Type.STRING }
+    }
+  };
+
+  const sceneRequired: string[] = ["id", "description", "charactersInScene"];
+
+  if (isCustomAudio) {
+      sceneProperties.startTime = { type: Type.NUMBER };
+      sceneProperties.endTime = { type: Type.NUMBER };
+      sceneRequired.push("startTime", "endTime");
+  } else {
+      sceneProperties.script = {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              characterId: { type: Type.STRING },
+              text: { type: Type.STRING, description: "Russian dialogue text." }
+            },
+            required: ["characterId", "text"]
+          }
+      };
+      sceneRequired.push("duration", "script");
+  }
+
+  return {
+    type: Type.OBJECT,
+    properties: {
+      title: { type: Type.STRING, description: "Название фильма на русском" },
+      summary: { type: Type.STRING, description: "Краткое описание на русском" },
+      cast: {
+        type: Type.ARRAY,
+        description: "List of all characters appearing in the movie.",
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            id: { type: Type.STRING },
+            name: { type: Type.STRING, description: "Russian name" },
+            description: { type: Type.STRING, description: "Visual appearance description." }
+          },
+          required: ["id", "name", "description"]
+        }
+      },
+      scenes: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: sceneProperties,
+          required: sceneRequired
+        }
+      }
+    },
+    required: ["title", "summary", "cast", "scenes"]
+  };
+};
+
+const getStyleInstructions = (style: VisualStyle): string => {
+  const prefix = "VISUAL STYLE:";
+  switch (style) {
+    case 'cartoon-3d': return `${prefix} 3D Pixar style, volume lighting, cute, rendered.`;
+    case 'cinematic': return `${prefix} Cinematic movie shot, realistic, dramatic lighting, 8k.`;
+    case 'anime': return `${prefix} Anime style, Studio Ghibli inspired, vibrant.`;
+    case 'pixel-art': return `${prefix} Pixel Art, 16-bit retro game style.`;
+    case 'noir': return `${prefix} Film Noir, black and white, high contrast, moody.`;
+    case 'cyberpunk': return `${prefix} Cyberpunk, neon lights, futuristic, night time.`;
+    case 'watercolor': return `${prefix} Watercolor painting, soft edges, artistic.`;
+    case 'retro-game': return `${prefix} Retro 90s video game style.`;
+    case 'flat':
+    default: return `${prefix} Flat Design, minimalist vector illustration, clean lines.`;
+  }
+};
+
+// --- VISUAL GENERATION HELPERS ---
+
+const generateImage = async (prompt: string, aspectRatio: AspectRatio, referenceImages: string[] = []): Promise<string | undefined> => {
+    try {
+        const parts: any[] = [{ text: prompt }];
+        if (referenceImages.length > 0) {
+           parts.push({ inlineData: { mimeType: 'image/jpeg', data: referenceImages[0].split(',')[1] } });
+           parts.push({ text: "Use this image as a strict character reference." });
+        }
+        const finalPrompt = `${prompt} Aspect Ratio: ${aspectRatio}`;
+        const response = await genAI.models.generateContent({
+            model: 'gemini-2.5-flash-image',
+            contents: { parts: [{ text: finalPrompt }] }
+        });
+        for (const part of response.candidates?.[0]?.content?.parts || []) {
+            if (part.inlineData) return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+        }
+    } catch (e) {
+        console.error("Image generation failed", e);
+    }
+    return undefined;
+};
+
+// --- DATA HYDRATION ---
+
+const hydrateMovieFromNormalized = (normalizedData: any, style: VisualStyle, audioMode: AudioMode, aspectRatio: AspectRatio): Movie => {
+    const castMap = new Map<string, {name: string, description: string}>();
+    if (normalizedData.cast) {
+        normalizedData.cast.forEach((c: any) => castMap.set(c.id, { name: c.name, description: c.description }));
+    }
+
+    const scenes: Scene[] = normalizedData.scenes.map((s: any) => {
+        const charactersInScene: Character[] = (s.charactersInScene || []).map((charId: string) => {
+             const castInfo = castMap.get(charId) || { name: 'Unknown', description: '' };
+             return {
+                 id: charId,
+                 name: castInfo.name,
+             } as Character;
+        });
+
+        return {
+            id: s.id,
+            startTime: s.startTime,
+            endTime: s.endTime,
+            duration: s.duration,
+            description: s.description,
+            characters: charactersInScene,
+            script: s.script || []
+        } as Scene;
+    });
+
+    return {
+        title: normalizedData.title,
+        summary: normalizedData.summary,
+        style,
+        audioMode,
+        aspectRatio,
+        scenes
+    };
+};
+
+// --- ORCHESTRATORS ---
+
+const enrichScenesWithVisuals = async (movie: Movie, characterConfigs: CharacterConfig[]) => {
+    // Collect all character references
+    const allRefs = characterConfigs.filter(c => c.referenceImageData).map(c => c.referenceImageData!);
+    const styleInstruction = getStyleInstructions(movie.style);
+
+    // Create a context string for the cast to help the image generator know who is who
+    // We can pass this as part of the prompt
+    
+    const promises = movie.scenes.map(async (scene) => {
+        // Construct a rich prompt for the image generator
+        let prompt = `${styleInstruction} Scene: ${scene.description}.`;
+        
+        // Add character descriptions if they are in the scene
+        if (scene.characters.length > 0) {
+             // We need to look up the description from the "cast" (which we don't have direct access to here easily unless we passed it down, 
+             // or we can rely on the scene description being detailed enough).
+             // To fix this properly, let's rely on the AI's scene description being good, 
+             // but append the character config descriptions if available.
+             const charsInScene = scene.characters.map(c => {
+                 const config = characterConfigs.find(conf => conf.id === c.id);
+                 return config ? `${config.name} (${config.description})` : c.name;
+             }).join(', ');
+             prompt += ` Characters present: ${charsInScene}.`;
+        }
+
+        prompt += ` Aspect Ratio ${movie.aspectRatio}. High quality, detailed.`;
+
+        const bgImage = await generateImage(prompt, movie.aspectRatio, allRefs.length > 0 ? [allRefs[0]] : []);
+        if (bgImage) scene.backgroundImageUrl = bgImage;
+    });
+
+    await Promise.all(promises);
+    return movie;
+};
+
+// --- EXPORTED FUNCTIONS ---
 
 export const generateSpeech = async (text: string, voiceName: string): Promise<string | undefined> => {
   const maxRetries = 3;
@@ -87,11 +221,7 @@ export const generateSpeech = async (text: string, voiceName: string): Promise<s
         contents: [{ parts: [{ text }] }],
         config: {
           responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: voiceName || 'Puck' },
-            },
-          },
+          speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voiceName || 'Puck' } } },
         },
       });
       return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
@@ -106,138 +236,121 @@ export const generateSpeech = async (text: string, voiceName: string): Promise<s
   return undefined;
 };
 
-// Updated Image Generator to accept Reference Images
-const generateImage = async (prompt: string, referenceImages: string[] = []): Promise<string | undefined> => {
-    try {
-        const parts: any[] = [{ text: prompt }];
-        
-        if (referenceImages.length > 0) {
-           parts.push({ 
-             inlineData: { 
-               mimeType: 'image/jpeg', 
-               data: referenceImages[0].split(',')[1] 
-             } 
-           });
-           parts.push({ text: "Use this image as a strict visual reference for the character/style in the scene." });
-        }
-
-        const response = await genAI.models.generateContent({
-            model: 'gemini-2.5-flash-image',
-            contents: { parts }
-        });
-
-        for (const part of response.candidates?.[0]?.content?.parts || []) {
-            if (part.inlineData) {
-                return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-            }
-        }
-    } catch (e) {
-        console.error("Image generation failed", e);
-    }
-    return undefined;
-};
-
 export const generateMovie = async (
   prompt: string, 
   style: VisualStyle, 
-  mode: GenerationMode, 
   sceneCount: SceneCount,
   audioMode: AudioMode,
+  aspectRatio: AspectRatio,
   characterConfigs: CharacterConfig[]
 ): Promise<Movie> => {
   const styleInstruction = getStyleInstructions(style);
   
   let characterContext = "";
   if (characterConfigs.length > 0) {
-    characterContext = `
-    ИСПОЛЬЗУЙ ЭТИХ ПЕРСОНАЖЕЙ (включи их в массив characters в сценах):
-    ${characterConfigs.map(c => `- ID: ${c.id}, Имя: ${c.name}, Описание: ${c.description}`).join('\n')}
-    `;
+    characterContext = `Include these characters: ${characterConfigs.map(c => `${c.name} (ID: ${c.id}, Desc: ${c.description})`).join(', ')}.`;
   }
 
-  const svgInstruction = mode === 'svg' ? `
-    РЕЖИМ ГЕНЕРАЦИИ SVG (ART MODE):
-    1. Ты - векторный художник. Твоя задача - рисовать детальные сцены кодом.
-    2. ФОН (backgroundSvg): НЕ оставляй его пустым. Рисуй окружение используя множество фигур (<rect>, <circle>, <path>). Если это лес - нарисуй деревья из треугольников и прямоугольников. Если комната - нарисуй окна, двери, мебель.
-    3. ПЕРСОНАЖИ (svgBody): ОБЯЗАТЕЛЬНО рисуй персонажей. Собери их из примитивов (круг-голова, прямоугольник-тело, линии-руки). НЕ используй внешние картинки, только SVG код внутри <g>.
-    4. СЛОЖНОСТЬ: Не бойся использовать много тегов. Если нужно создать сложный объект - собери его из 10-20 мелких простых фигур (пиксель-арт или геометрическая аппликация).
-    5. Используй <path d="..."> для более сложных форм, но держи координаты в разумных пределах (viewBox 0 0 100 100).
-  ` : '';
-
-  // 1. Script Generation
+  // STEP 1: Generate Structure
   const response = await genAI.models.generateContent({
     model: "gemini-3-flash-preview",
-    contents: `Создай полный сценарий анимационного фильма в формате JSON.
-    Запрос: "${prompt}".
-    Количество сцен: ${sceneCount}.
-    Стиль: ${styleInstruction}.
-    
-    ${svgInstruction}
+    contents: `Write a movie script JSON in RUSSIAN language.
+    Prompt: "${prompt}".
+    Scene Count: ${sceneCount}.
+    Style: ${style}. Ratio: ${aspectRatio}.
     ${characterContext}
     
-    ВАЖНО ПО ДИАЛОГАМ:
-    - В каждой сцене персонажи должны РАЗГОВАРИВАТЬ.
-    - Массив 'script' должен содержать МИНИМУМ 3-4 реплики для каждой сцены (кроме чисто пейзажных сцен).
-    - Диалоги должны развивать сюжет.
-    
-    Язык: Русский.
+    IMPORTANT: Provide a 'cast' list first, then 'scenes'.
+    For each scene, provide a 'description' that is extremely visual and detailed, suitable for an image generator. 
+    List characters present in 'charactersInScene'.
     `,
     config: {
       responseMimeType: "application/json",
-      responseSchema: movieSchema,
-      systemInstruction: "Ты профессиональный режиссер и SVG-художник. Ты создаешь насыщенные визуально и сюжетно истории."
+      responseSchema: getNormalizedStorySchema(false),
+      systemInstruction: "You are a screenwriter. Output strict JSON. Language: Russian.",
+      maxOutputTokens: 8192
     }
   });
 
-  const text = response.text;
-  if (!text) throw new Error("AI Empty Response");
-  
-  const movieData = JSON.parse(text) as Movie;
-  movieData.style = style;
-  movieData.mode = mode;
-  movieData.audioMode = audioMode;
+  const normalizedData = safeJsonParse<any>(response.text);
+  const movieData = hydrateMovieFromNormalized(normalizedData, style, audioMode, aspectRatio);
 
-  // 2. Visual Generation (Only for Image Mode)
-  if (mode === 'image') {
-      const allRefs = characterConfigs
-        .filter(c => c.referenceImageData)
-        .map(c => c.referenceImageData!);
-
-      for (const scene of movieData.scenes) {
-          const scenePrompt = `${styleInstruction} Full scene illustration. ${scene.description}. Cinematic composition.`;
-          const bgImage = await generateImage(scenePrompt, allRefs.length > 0 ? [allRefs[0]] : []);
-          if (bgImage) scene.backgroundImageUrl = bgImage;
-          
-          // Clear SVG data in image mode to avoid confusion
-          scene.backgroundSvg = undefined;
-          scene.characters.forEach(c => c.svgBody = undefined);
-      }
-  }
-
-  return movieData;
+  // STEP 2: Generate Visuals
+  return await enrichScenesWithVisuals(movieData, characterConfigs);
 };
 
-export const generateSceneFromPrompt = async (prompt: string, currentMovie: Movie): Promise<Scene> => {
-    const sceneSchema: Schema = movieSchema.properties!.scenes!.items as Schema;
+export const generateMovieFromAudio = async (
+    audioBase64: string,
+    style: VisualStyle,
+    aspectRatio: AspectRatio,
+    characterConfigs: CharacterConfig[]
+): Promise<Movie> => {
+    const styleInstruction = getStyleInstructions(style);
     
-    const svgHint = currentMovie.mode === 'svg' 
-        ? "РЕЖИМ SVG: Рисуй детализированный backgroundSvg и svgBody для персонажей используя множество примитивов (<rect>, <circle>). Не оставляй пустоты." 
-        : "";
+    // STEP 1: Analysis (Structure)
+    const response = await genAI.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: [
+            { inlineData: { mimeType: "audio/mp3", data: audioBase64 } },
+            {
+                text: `
+                Analyze this audio. Split into visual scenes (max 20).
+                Style: ${styleInstruction}.
+                ${characterConfigs.length > 0 ? 'Detect these characters: ' + characterConfigs.map(c=>c.name).join(', ') : ''}
+                
+                Return JSON with 'cast' and 'scenes'. 
+                The 'description' must be a detailed prompt for an image generator (in Russian).
+                `
+            }
+        ],
+        config: {
+            responseMimeType: "application/json",
+            responseSchema: getNormalizedStorySchema(true),
+            systemInstruction: "Video editor assistant. Output strict JSON in Russian.",
+            maxOutputTokens: 8192
+        }
+    });
+
+    const normalizedData = safeJsonParse<any>(response.text);
+    const movieData = hydrateMovieFromNormalized(normalizedData, style, 'custom', aspectRatio);
+    
+    movieData.customAudioData = audioBase64;
+
+    // STEP 2: Visuals
+    return await enrichScenesWithVisuals(movieData, characterConfigs);
+}
+
+export const generateSceneFromPrompt = async (prompt: string, currentMovie: Movie): Promise<Scene> => {
+    const singleSceneSchema: Schema = {
+        type: Type.OBJECT,
+        properties: {
+            id: { type: Type.STRING },
+            duration: { type: Type.NUMBER },
+            description: { type: Type.STRING },
+            script: { type: Type.ARRAY, items: { type: Type.OBJECT, properties: { characterId: { type: Type.STRING }, text: { type: Type.STRING } } } }
+        }
+    };
 
     const sceneResponse = await genAI.models.generateContent({
         model: "gemini-3-flash-preview",
-        contents: `Сгенерируй ОДНУ сцену с диалогом (минимум 3 реплики). Контекст: ${currentMovie.title}. Стиль: ${currentMovie.style}. Запрос: "${prompt}". ${svgHint}`,
-        config: { responseMimeType: "application/json", responseSchema: sceneSchema }
+        contents: `Generate ONE scene in RUSSIAN. Context: ${currentMovie.title}. Style: ${currentMovie.style}. Prompt: "${prompt}".`,
+        config: { 
+          responseMimeType: "application/json", 
+          responseSchema: singleSceneSchema,
+          maxOutputTokens: 8192
+        }
     });
 
-    const text = sceneResponse.text;
-    if(!text) throw new Error("Failed");
-    const scene = JSON.parse(text) as Scene;
+    const scene = safeJsonParse<Scene>(sceneResponse.text);
 
-    if (currentMovie.mode === 'image') {
-         const bgImage = await generateImage(`${currentMovie.style} Full scene: ${scene.description}`);
-         if (bgImage) scene.backgroundImageUrl = bgImage;
-    }
+    // Generate Image
+    const fullPrompt = `${getStyleInstructions(currentMovie.style)} Scene: ${scene.description}. Aspect Ratio ${currentMovie.aspectRatio}.`;
+    const bgImage = await generateImage(fullPrompt, currentMovie.aspectRatio);
+    if (bgImage) scene.backgroundImageUrl = bgImage;
+    
+    // Initialize empty chars for safety
+    scene.characters = []; 
+    
     return scene;
 }
 
